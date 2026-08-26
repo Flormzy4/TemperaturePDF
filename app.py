@@ -187,7 +187,7 @@ with col1:
             type="primary",
             width="stretch"
         ):
-            st.switch_page("Pages/linkitall.py")
+            st.switch_page("pages/linkitall.py")
 
 
 # ============================================================
@@ -221,7 +221,7 @@ with col2:
             key="kleventa_button",
             width="stretch"
         ):
-            st.switch_page("Pages/kleventa.py")
+            st.switch_page("pages/kleventa.py")
 
 
 # ============================================================
