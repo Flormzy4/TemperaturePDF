@@ -35,118 +35,46 @@ uploaded_file = st.file_uploader(
 )
 
 
-def extract_temperature_data(pdf_bytes):
-
-    pdf = fitz.open(
-        stream=pdf_bytes,
-        filetype="pdf"
-    )
-
-    full_text = ""
-
-    for page in pdf:
-        full_text += page.get_text() + "\n"
-
-    pdf.close()
-
+def temperature_rows(page):
+    """Read complete table rows by position, independent of PDF text order."""
     rows = []
+    for word in sorted(page.get_text("words"), key=lambda w: (w[1], w[0])):
+        if not rows or abs(rows[-1]["y"] - word[1]) > 2:
+            rows.append({"y": word[1], "words": [word]})
+        else:
+            rows[-1]["words"].append(word)
 
-    # --------------------------------------------------------
-    # Find rækker med:
-    #
-    # Dato
-    # Tid
-    # Stock1
-    # Stock2
-    # Stock3
-    # Outside
-    # Water
-    # Inlet
-    #
-    # Vi bruger en mere fleksibel parser, fordi Kleventa-PDF'er
-    # kan have forskellig spacing.
-    # --------------------------------------------------------
+    for row in rows:
+        words = sorted(row["words"], key=lambda w: w[0])
+        date = next((w for w in words if re.fullmatch(r"\d{2}[-/]\d{2}[-/]\d{4}", w[4])), None)
+        time = next((w for w in words if re.fullmatch(r"\d{2}:\d{2}", w[4])), None)
+        if date is None or time is None:
+            continue
+        temperatures = [w for w in words if w[0] >= time[2]
+                        and re.fullmatch(r"-?\d+(?:[,.]\d+)?(?:°C)?", w[4])]
+        # Reject partial rows rather than shifting one sensor into another column.
+        if len(temperatures) != 6:
+            continue
+        yield date[4], time[4], temperatures
 
-    row_pattern = re.compile(
-        r"(\d{2}-\d{2}-\d{4})\s+"
-        r"(\d{2}:\d{2})"
-        r"(.*?)(?=\n\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}|\Z)",
-        re.S
-    )
 
-    for match in row_pattern.finditer(full_text):
-
-        dato = match.group(1)
-        tid = match.group(2)
-        remainder = match.group(3)
-
-        # Find numeriske temperaturværdier.
-        #
-        # Tillader:
-        # 30
-        # 30,4
-        # 30.4
-        # 30,4°C
-        # 30.4°C
-        #
-        numbers = re.findall(
-            r"-?\d+(?:[,.]\d+)?",
-            remainder
-        )
-
-        values = []
-
-        for number in numbers:
-
-            try:
-
-                value = float(
-                    number.replace(",", ".")
-                )
-
-                # Temperaturer forventes at ligge
-                # inden for et realistisk interval.
-                if -50 <= value <= 100:
-                    values.append(value)
-
-            except ValueError:
-                continue
-
-        # Vi skal bruge de første seks temperaturer:
-        #
-        # Stock1
-        # Stock2
-        # Stock3
-        # Outside
-        # Water
-        # Inlet
-
-        if len(values) >= 6:
-
-            rows.append({
-                "Dato": dato,
-                "Tid": tid,
-                "Stock1": values[0],
-                "Stock2": values[1],
-                "Stock3": values[2],
-                "Outside": values[3],
-                "Water": values[4],
-                "Inlet": values[5]
-            })
-
+def extract_temperature_data(pdf_bytes):
+    rows = []
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as pdf:
+        for page in pdf:
+            for date, time, words in temperature_rows(page):
+                values = [float(w[4].replace("°C", "").replace(",", ".")) for w in words]
+                rows.append(dict(zip(
+                    ["Dato", "Tid", "Stock1", "Stock2", "Stock3", "Outside", "Water", "Inlet"],
+                    [date, time, *values]
+                )))
     df = pd.DataFrame(rows)
-
     if not df.empty:
-
         df["DateTime"] = pd.to_datetime(
-            df["Dato"] + " " + df["Tid"],
-            dayfirst=True
+            df["Dato"].str.replace("/", "-", regex=False) + " " + df["Tid"],
+            format="%d-%m-%Y %H:%M"
         )
-
-        df = df.sort_values(
-            "DateTime"
-        ).reset_index(drop=True)
-
+        df = df.sort_values("DateTime", kind="stable").reset_index(drop=True)
     return df
 
 
@@ -719,423 +647,50 @@ def analyse_sensor(values):
 # OPRET KORRIGERET KLEVENTA PDF
 # ============================================================
 
-def create_corrected_pdf(
-    pdf_bytes,
-    df,
-    results
-):
-
-    pdf = fitz.open(
-        stream=pdf_bytes,
-        filetype="pdf"
-    )
-
-    sensors = [
-        "Stock1",
-        "Stock2",
-        "Stock3"
-    ]
-
-    # ========================================================
-    # KLEVENTA LAYOUT
-    #
-    # Disse positioner er målt direkte fra den uploadede PDF.
-    #
-    # Stock1 center ca. 196.66
-    # Stock2 center ca. 263.98
-    # Stock3 center ca. 331.30
-    #
-    # De øvrige kolonner bliver bevidst ignoreret.
-    # ========================================================
-
-    sensor_x_positions = {
-        "Stock1": 196.66,
-        "Stock2": 263.98,
-        "Stock3": 331.30
-    }
-
-    # ========================================================
-    # LOOKUP
-    #
-    # Vi gemmer alle rækker pr. dato/tid.
-    #
-    # Det er vigtigt fordi Kleventa kan have samme tidspunkt
-    # flere gange.
-    # ========================================================
-
+def create_corrected_pdf(pdf_bytes, df, results):
+    sensors = ["Stock1", "Stock2", "Stock3"]
     lookup = {}
-
-    for i in range(len(df)):
-
-        key = (
-            str(df.iloc[i]["Dato"]),
-            str(df.iloc[i]["Tid"])
-        )
-
-        if key not in lookup:
-            lookup[key] = []
-
-        lookup[key].append(i)
-
-    # Holder styr på hvilken af eventuelle dubletter
-    # vi er kommet til.
-
+    for i, row in df.iterrows():
+        lookup.setdefault((row["Dato"], row["Tid"]), []).append(i)
     used_rows = {}
 
-    # ========================================================
-    # GENNEMGÅ ALLE SIDER
-    # ========================================================
-
-    for page in pdf:
-
-        words = page.get_text(
-            "words"
-        )
-
-        # ====================================================
-        # GRUPPER ORD EFTER RÆKKE
-        # ====================================================
-
-        rows = []
-
-        for word in sorted(
-            words,
-            key=lambda w: (
-                w[1],
-                w[0]
-            )
-        ):
-
-            y = word[1]
-
-            if (
-                not rows
-                or abs(
-                    rows[-1]["y"] - y
-                ) > 1
-            ):
-
-                rows.append({
-                    "y": y,
-                    "words": [word]
-                })
-
-            else:
-
-                rows[-1]["words"].append(
-                    word
-                )
-
-        # ====================================================
-        # SAMLER ALLE ÆNDRINGER PÅ SIDEN FØRST
-        # ====================================================
-
-        replacements = []
-
-        # ====================================================
-        # FIND TEMPERATURRÆKKER
-        # ====================================================
-
-        for row in rows:
-
-            row_words = sorted(
-                row["words"],
-                key=lambda w: w[0]
-            )
-
-            texts = [
-                w[4]
-                for w in row_words
-            ]
-
-            # ------------------------------------------------
-            # FIND DATO
-            # ------------------------------------------------
-
-            date_index = None
-
-            for i, text in enumerate(texts):
-
-                if re.fullmatch(
-                    r"\d{2}-\d{2}-\d{4}",
-                    text
-                ):
-
-                    date_index = i
-                    break
-
-            # ------------------------------------------------
-            # FIND TID
-            # ------------------------------------------------
-
-            time_index = None
-
-            for i, text in enumerate(texts):
-
-                if re.fullmatch(
-                    r"\d{2}:\d{2}",
-                    text
-                ):
-
-                    time_index = i
-                    break
-
-            # ------------------------------------------------
-            # Hvis det ikke er en temperatur-række,
-            # spring over.
-            # ------------------------------------------------
-
-            if (
-                date_index is None
-                or time_index is None
-            ):
-
-                continue
-
-            dato = texts[
-                date_index
-            ]
-
-            tid = texts[
-                time_index
-            ]
-
-            key = (
-                dato,
-                tid
-            )
-
-            if key not in lookup:
-
-                continue
-
-            # =================================================
-            # HÅNDTER DUBLETTER
-            # =================================================
-
-            current_position = used_rows.get(
-                key,
-                0
-            )
-
-            possible_rows = lookup[key]
-
-            if (
-                current_position
-                >= len(possible_rows)
-            ):
-
-                continue
-
-            dataframe_index = possible_rows[
-                current_position
-            ]
-
-            used_rows[key] = (
-                current_position + 1
-            )
-
-            # =================================================
-            # FIND STOCK1, STOCK2 OG STOCK3
-            # =================================================
-
-            for sensor in sensors:
-
-                target_x = sensor_x_positions[
-                    sensor
-                ]
-
-                candidates = []
-
-                for word in row_words:
-
-                    text = word[4]
-
-                    # Temperaturformat:
-                    #
-                    # 30.4°C
-                    # 29.8°C
-                    # 22.6°C
-
-                    if not re.fullmatch(
-                        r"-?\d+(?:[,.]\d+)?°C",
-                        text
-                    ):
-
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as pdf:
+        for page in pdf:
+            spans = [span for block in page.get_text("dict")["blocks"]
+                     if "lines" in block for line in block["lines"] for span in line["spans"]]
+            replacements = []
+            for date, time, words in temperature_rows(page):
+                key = (date, time)
+                position = used_rows.get(key, 0)
+                if key not in lookup or position >= len(lookup[key]):
+                    raise ValueError("PDF-rækkerne stemmer ikke overens med analysen.")
+                index = lookup[key][position]
+                used_rows[key] = position + 1
+                for sensor, word in zip(sensors, words[:3]):
+                    value = round(float(results[sensor]["corrected"][index]), 1)
+                    if value == round(float(df.iloc[index][sensor]), 1):
                         continue
+                    span = next(s for s in spans
+                                if fitz.Rect(s["bbox"]).contains(fitz.Rect(word[:4])))
+                    text = f"{value:.1f}"
+                    if "," in word[4]:
+                        text = text.replace(".", ",")
+                    if word[4].endswith("°C"):
+                        text += "°C"
+                    font = "heit" if "Oblique" in span["font"] or "Italic" in span["font"] else "helv"
+                    color = fitz.sRGB_to_pdf(span["color"])
+                    replacements.append((word, text, span, font, color))
+            for word, *_ in replacements:
+                page.add_redact_annot(fitz.Rect(word[:4]), fill=None)
+            if replacements:
+                page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
+                                      graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                                      text=fitz.PDF_REDACT_TEXT_REMOVE)
+            for word, text, span, font, color in replacements:
+                page.insert_text((word[0], span["origin"][1]), text,
+                                 fontname=font, fontsize=span["size"], color=color, overlay=True)
+        return pdf.tobytes(garbage=4, deflate=True)
 
-                    x_center = (
-                        word[0]
-                        + word[2]
-                    ) / 2
-
-                    distance = abs(
-                        x_center
-                        - target_x
-                    )
-
-                    # Vi accepterer kun en temperatur
-                    # tæt på den pågældende Stock-kolonne.
-
-                    if distance < 10:
-
-                        candidates.append(
-                            word
-                        )
-
-                if not candidates:
-
-                    continue
-
-                # Den temperatur der ligger tættest
-                # på kolonnens center vælges.
-
-                original_word = min(
-                    candidates,
-                    key=lambda w:
-                    abs(
-                        (
-                            w[0]
-                            + w[2]
-                        ) / 2
-                        - target_x
-                    )
-                )
-
-                # =================================================
-                # ORIGINAL VÆRDI
-                # =================================================
-
-                original_value = float(
-                    df.iloc[
-                        dataframe_index
-                    ][sensor]
-                )
-
-                # =================================================
-                # NY VÆRDI
-                # =================================================
-
-                new_value = float(
-                    results[
-                        sensor
-                    ]["corrected"][
-                        dataframe_index
-                    ]
-                )
-
-                original_value = round(
-                    original_value,
-                    1
-                )
-
-                new_value = round(
-                    new_value,
-                    1
-                )
-
-                # =================================================
-                # KUN HVIS VÆRDIEN FAKTISK ÆNDRES
-                # =================================================
-
-                if (
-                    original_value
-                    == new_value
-                ):
-
-                    continue
-
-                new_text = (
-                    f"{new_value:.1f}°C"
-                )
-
-                replacements.append({
-                    "word": original_word,
-                    "text": new_text
-                })
-
-        # ====================================================
-        # FJERN DE GAMLE TEMPERATURER
-        # ====================================================
-
-        for replacement in replacements:
-
-            word = replacement[
-                "word"
-            ]
-
-            rect = fitz.Rect(
-                word[0],
-                word[1],
-                word[2],
-                word[3]
-            )
-
-            page.add_redact_annot(
-                rect,
-                fill=None
-            )
-
-        if replacements:
-
-            page.apply_redactions(
-                images=fitz.PDF_REDACT_IMAGE_NONE,
-                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
-                text=fitz.PDF_REDACT_TEXT_REMOVE
-            )
-
-        # ====================================================
-        # SKRIV DE NYE VÆRDIER
-        #
-        # Kleventa bruger Helvetica-Oblique 10 pt.
-        # ====================================================
-
-        for replacement in replacements:
-
-            word = replacement[
-                "word"
-            ]
-
-            new_text = replacement[
-                "text"
-            ]
-
-            # Original Kleventa-tekst er 10 pt.
-            font_size = 10
-
-            # Samme venstre position som originalen.
-            x = word[0]
-
-            # Original baseline.
-            #
-            # Kleventa's tekstbbox ligger ca. 2.84 pt
-            # under baseline.
-            y = word[3] - 2.84
-
-            page.insert_text(
-                (
-                    x,
-                    y
-                ),
-                new_text,
-                fontname="Helvetica-Oblique",
-                fontsize=font_size,
-                color=(0, 0, 0),
-                overlay=True
-            )
-
-    # ========================================================
-    # GEM PDF
-    # ========================================================
-
-    output_bytes = pdf.tobytes(
-        garbage=4,
-        deflate=True
-    )
-
-    pdf.close()
-
-    return output_bytes
 # ============================================================
 # APPENS RESULTAT
 # ============================================================
@@ -1147,6 +702,10 @@ if uploaded_file:
     )
 
     pdf_bytes = uploaded_file.read()
+
+    if st.session_state.get("kleventa_pdf_bytes") != pdf_bytes:
+        st.session_state.pop("kleventa_results", None)
+        st.session_state["kleventa_pdf_bytes"] = pdf_bytes
 
     df = extract_temperature_data(
         pdf_bytes
